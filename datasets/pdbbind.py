@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 import torch
 from rdkit import Chem
-from rdkit.Chem import MolFromSmiles, AddHs
+from rdkit.Chem import MolFromSmiles, AddHs, GetPeriodicTable
 from torch_geometric.data import Dataset, HeteroData
 from torch_geometric.transforms import BaseTransform
 from tqdm import tqdm
@@ -45,7 +45,7 @@ class NoiseTransform(BaseTransform):
     def get_time(self):
         if self.time_independent:
             t = np.random.beta(self.alpha, self.beta)
-            t_tr, t_rot, t_tor = t,t,t
+            t_tr, t_rot, t_tor = t, t, t
         else:
             t = None
             if self.mixing_coeff == 0:
@@ -57,12 +57,12 @@ class NoiseTransform(BaseTransform):
                 t1 = t1 * self.minimum_t
                 t2 = np.random.beta(self.alpha, self.beta)
                 t2 = self.minimum_t + t2 * (1 - self.minimum_t)
-                t = choice * t1 + (1 - choice) * t2 
+                t = choice * t1 + (1 - choice) * t2
 
-            t_tr, t_rot, t_tor = t,t,t
+            t_tr, t_rot, t_tor = t, t, t
         return t_tr, t_rot, t_tor, t
 
-    def apply_noise(self, data, t_tr, t_rot, t_tor, t, tr_update = None, rot_update=None, torsion_updates=None):
+    def apply_noise(self, data, t_tr, t_rot, t_tor, t, tr_update=None, rot_update=None, torsion_updates=None):
         if not torch.is_tensor(data['ligand'].pos):
             data['ligand'].pos = random.choice(data['ligand'].pos)
 
@@ -113,6 +113,87 @@ class NoiseTransform(BaseTransform):
             crop_beyond(data, tr_sigma * 3 + self.crop_beyond_cutoff, self.all_atom)
         set_time(data, t, t_tr, t_rot, t_tor, 1, self.all_atom, device=None, include_miscellaneous_atoms=self.include_miscellaneous_atoms)
         return data
+
+
+# ======================================================================
+# Physics-guidance ligand features (Option A for DiffDock + Boltz-style potentials)
+# ======================================================================
+
+periodic_table = GetPeriodicTable()
+
+
+def compute_ligand_physics_features_from_rdkit(mol: Chem.Mol) -> dict:
+    """
+    Compute per-atom and per-bond physical features for the ligand,
+    to be used by physics-based potentials during inference.
+
+    Returns a dict of torch tensors keyed by:
+        - lig_Z:               [num_atoms]         atomic numbers
+        - lig_vdw_radius:      [num_atoms]         vdW radii (Å)
+        - lig_is_aromatic:     [num_atoms]         0/1
+        - lig_degree:          [num_atoms]         total degree
+        - lig_hybridization:   [num_atoms]         integer code of RDKit hybridization
+        - lig_chiral_tag:      [num_atoms]         integer code of RDKit chiral tag
+        - lig_bond_index:      [2, num_bonds*2]    undirected edge index (i,j) and (j,i)
+        - lig_bond_order:      [num_bonds*2]       RDKit bond order as float (1.0, 2.0, 1.5, ...)
+    """
+    num_atoms = mol.GetNumAtoms()
+    Z_list = []
+    vdw_list = []
+    is_aromatic_list = []
+    degree_list = []
+    hybridization_list = []
+    chiral_tag_list = []
+
+    for atom in mol.GetAtoms():
+        z = atom.GetAtomicNum()
+        Z_list.append(z)
+        # RDKit has vdW radii on the periodic table
+        vdw = periodic_table.GetRvdw(z) if z > 0 else 0.0
+        vdw_list.append(vdw)
+        is_aromatic_list.append(1.0 if atom.GetIsAromatic() else 0.0)
+        degree_list.append(atom.GetTotalDegree())
+        hybridization_list.append(int(atom.GetHybridization()))
+        chiral_tag_list.append(int(atom.GetChiralTag()))
+
+    row, col = [], []
+    bond_order = []
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        row += [i, j]
+        col += [j, i]
+        bo = float(bond.GetBondTypeAsDouble())
+        bond_order += [bo, bo]
+
+    feats = {
+        "lig_Z": torch.tensor(Z_list, dtype=torch.long),
+        "lig_vdw_radius": torch.tensor(vdw_list, dtype=torch.float),
+        "lig_is_aromatic": torch.tensor(is_aromatic_list, dtype=torch.float),
+        "lig_degree": torch.tensor(degree_list, dtype=torch.long),
+        "lig_hybridization": torch.tensor(hybridization_list, dtype=torch.long),
+        "lig_chiral_tag": torch.tensor(chiral_tag_list, dtype=torch.long),
+        "lig_bond_index": torch.tensor([row, col], dtype=torch.long) if len(row) > 0 else torch.zeros((2, 0), dtype=torch.long),
+        "lig_bond_order": torch.tensor(bond_order, dtype=torch.float) if len(bond_order) > 0 else torch.zeros((0,), dtype=torch.float),
+    }
+    return feats
+
+
+def attach_ligand_physics_features(complex_graph: HeteroData, mol: Chem.Mol):
+    """
+    Attach ligand physics features as attributes on complex_graph['ligand'].
+
+    After this call, for each complex_graph you will have, e.g.:
+        complex_graph['ligand'].lig_Z
+        complex_graph['ligand'].lig_vdw_radius
+        complex_graph['ligand'].lig_bond_index
+        ...
+    """
+    if mol is None:
+        return
+    feats = compute_ligand_physics_features_from_rdkit(mol)
+    for key, value in feats.items():
+        complex_graph['ligand'][key] = value
 
 
 class PDBBind(Dataset):
@@ -363,17 +444,24 @@ class PDBBind(Dataset):
             return [], []
 
         try:
-
+            # Read ligand molecule from disk (standard PDBBind path)
             lig = read_mol(self.pdbbind_dir, name, suffix=self.ligand_file, remove_hs=False)
+
             if self.max_lig_size != None and lig.GetNumHeavyAtoms() > self.max_lig_size:
                 print(f'Ligand with {lig.GetNumHeavyAtoms()} heavy atoms is larger than max_lig_size {self.max_lig_size}. Not including {name} in preprocessed data.')
                 return [], []
 
             complex_graph = HeteroData()
             complex_graph['name'] = name
+
+            # Build ligand graph (including torsion masks etc.)
             get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                         self.num_conformers, remove_hs=self.remove_hs, tries=self.matching_tries)
 
+            # === Attach ligand physics features for Boltz-style potentials (Option A) ===
+            attach_ligand_physics_features(complex_graph, lig)
+
+            # Build receptor graph
             moad_extract_receptor_structure(path=os.path.join(self.pdbbind_dir, name, f'{name}_{self.protein_file}.pdb'),
                                             complex_graph=complex_graph,
                                             neighbor_cutoff=self.receptor_radius,

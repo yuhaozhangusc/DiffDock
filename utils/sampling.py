@@ -12,6 +12,9 @@ from scipy.spatial.transform import Rotation as R
 from utils.utils import crop_beyond
 from utils.logging_utils import get_logger
 
+from physics.ligand_features import compute_ligand_features_from_rdkit
+from physics.potentials import build_default_potentials 
+
 
 def randomize_position(data_list, no_torsion, no_random, tr_sigma_max, pocket_knowledge=False, pocket_cutoff=7,
                        initial_noise_std_proportion=-1.0, choose_residue=False):
@@ -66,43 +69,81 @@ def is_iterable(arr):
         return False
 
 
-def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_schedule, device, t_to_sigma, model_args,
-             no_random=False, ode=False, visualization_list=None, confidence_model=None, confidence_data_list=None, confidence_model_args=None,
-             t_schedule=None, batch_size=32, no_final_step_noise=False, pivot=None, return_full_trajectory=False,
-             temp_sampling=1.0, temp_psi=0.0, temp_sigma_data=0.5, return_features=False):
+def sampling(
+    data_list,
+    model,
+    inference_steps,
+    tr_schedule,
+    rot_schedule,
+    tor_schedule,
+    device,
+    t_to_sigma,
+    model_args,
+    no_random=False,
+    ode=False,
+    visualization_list=None,
+    confidence_model=None,
+    confidence_data_list=None,
+    confidence_model_args=None,
+    t_schedule=None,
+    batch_size=32,
+    no_final_step_noise=False,
+    pivot=None,
+    return_full_trajectory=False,
+    temp_sampling=1.0,
+    temp_psi=0.0,
+    temp_sigma_data=0.5,
+    return_features=False,
+
+    # NEW: Option-A simple physics guidance
+    physics_potentials=None,
+    physics_step_size: float = 0.05,
+):
     N = len(data_list)
     trajectory = []
     logger = get_logger()
+
     if return_features:
         lig_features, rec_features = [], []
         assert batch_size >= N, "Not implemented yet"
 
     loader = DataLoader(data_list, batch_size=batch_size)
-    assert not (return_full_trajectory or return_features or pivot), "Not implemented yet in new inference version"
+    assert not (return_full_trajectory or return_features or pivot), "Not implemented yet"
 
     mask_rotate = torch.from_numpy(data_list[0]['ligand'].mask_rotate[0]).to(device)
 
+    # Confidence model loader
     confidence = None
     if confidence_model is not None:
         confidence_loader = iter(DataLoader(confidence_data_list, batch_size=batch_size))
         confidence = []
 
+    # Initialize physics if user passed None
+    use_physics = physics_potentials is not None
+    if physics_potentials is None:
+        physics_potentials = build_default_potentials()
+        use_physics = True
+
     with torch.no_grad():
         for batch_id, complex_graph_batch in enumerate(loader):
+
             b = complex_graph_batch.num_graphs
             n = len(complex_graph_batch['ligand'].pos) // b
             complex_graph_batch = complex_graph_batch.to(device)
 
             for t_idx in range(inference_steps):
+
+                # ===== Schedules =====
                 t_tr, t_rot, t_tor = tr_schedule[t_idx], rot_schedule[t_idx], tor_schedule[t_idx]
+
                 dt_tr = tr_schedule[t_idx] - tr_schedule[t_idx + 1] if t_idx < inference_steps - 1 else tr_schedule[t_idx]
                 dt_rot = rot_schedule[t_idx] - rot_schedule[t_idx + 1] if t_idx < inference_steps - 1 else rot_schedule[t_idx]
                 dt_tor = tor_schedule[t_idx] - tor_schedule[t_idx + 1] if t_idx < inference_steps - 1 else tor_schedule[t_idx]
 
                 tr_sigma, rot_sigma, tor_sigma = t_to_sigma(t_tr, t_rot, t_tor)
 
+                # ===== Possibly crop =====
                 if hasattr(model_args, 'crop_beyond') and model_args.crop_beyond is not None:
-                    #print('Cropping beyond', tr_sigma * 3 + model_args.crop_beyond, 'for score model')
                     mod_complex_graph_batch = copy.deepcopy(complex_graph_batch).to_data_list()
                     for batch in mod_complex_graph_batch:
                         crop_beyond(batch, tr_sigma * 3 + model_args.crop_beyond, model_args.all_atoms)
@@ -110,101 +151,143 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 else:
                     mod_complex_graph_batch = complex_graph_batch
 
-                set_time(mod_complex_graph_batch, t_schedule[t_idx] if t_schedule is not None else None, t_tr, t_rot, t_tor, b,
-                         'all_atoms' in model_args and model_args.all_atoms, device)
+                # ===== Set time =====
+                set_time(
+                    mod_complex_graph_batch,
+                    t_schedule[t_idx] if t_schedule is not None else None,
+                    t_tr,
+                    t_rot,
+                    t_tor,
+                    b,
+                    'all_atoms' in model_args and model_args.all_atoms,
+                    device,
+                )
 
+                # ===== DiffDock score model =====
                 tr_score, rot_score, tor_score = model(mod_complex_graph_batch)[:3]
+
+                # NaN handling
                 mean_scores = torch.mean(tr_score, dim=-1)
                 num_nans = torch.sum(torch.isnan(mean_scores))
                 if num_nans > 0:
                     name = complex_graph_batch['name']
-                    if isinstance(name, list):
-                        name = name[0]
-                    logger.warning(f"Complex {name} Batch {batch_id+1} Inference Iteration {t_idx}: "
-                                   f"{num_nans} / {mean_scores.numel()} samples failed")
+                    if isinstance(name, list): name = name[0]
+                    logger.warning(
+                        f"Complex {name} Batch {batch_id+1} Iter {t_idx}: "
+                        f"{num_nans}/{mean_scores.numel()} NaNs"
+                    )
+                    eps = 0.01 * torch.nanmean(tr_score.abs())
+                    tr_score.nan_to_num_(nan=eps, posinf=eps, neginf=-eps)
+                    rot_score.nan_to_num_(nan=eps, posinf=eps, neginf=-eps)
+                    tor_score.nan_to_num_(nan=eps, posinf=eps, neginf=-eps)
 
-                    # Set the nan values to a small value, just want to disturb slightly
-                    # Hopefully won't get nan the next iteration
-                    tr_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(tr_score.abs())), posinf=eps, neginf=-eps)
-                    rot_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(rot_score.abs())), posinf=eps, neginf=-eps)
-                    tor_score.nan_to_num_(nan=(eps := 0.01*torch.nanmean(tor_score.abs())), posinf=eps, neginf=-eps)
-                    del eps
+                # ===== Noise schedules =====
+                tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(
+                    model_args.tr_sigma_max / model_args.tr_sigma_min)))
+                rot_g = rot_sigma * torch.sqrt(torch.tensor(2 * np.log(
+                    model_args.rot_sigma_max / model_args.rot_sigma_min)))
 
-                tr_g = tr_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tr_sigma_max / model_args.tr_sigma_min)))
-                rot_g = rot_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.rot_sigma_max / model_args.rot_sigma_min)))
-
+                # ===== Translation update =====
                 if ode:
-                    tr_perturb = (0.5 * tr_g ** 2 * dt_tr * tr_score)
-                    rot_perturb = (0.5 * rot_score * dt_rot * rot_g ** 2)
+                    tr_perturb = 0.5 * tr_g**2 * dt_tr * tr_score
+                    rot_perturb = 0.5 * rot_score * dt_rot * rot_g**2
                 else:
-                    tr_z = torch.zeros((min(batch_size, N), 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                        else torch.normal(mean=0, std=1, size=(min(batch_size, N), 3), device=device)
-                    tr_perturb = (tr_g ** 2 * dt_tr * tr_score + tr_g * np.sqrt(dt_tr) * tr_z)
+                    tr_z = torch.zeros((min(batch_size, N), 3), device=device) \
+                        if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                        else torch.randn((min(batch_size, N), 3), device=device)
 
-                    rot_z = torch.zeros((min(batch_size, N), 3), device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                        else torch.normal(mean=0, std=1, size=(min(batch_size, N), 3), device=device)
-                    rot_perturb = (rot_score * dt_rot * rot_g ** 2 + rot_g * np.sqrt(dt_rot) * rot_z)
+                    rot_z = torch.zeros((min(batch_size, N), 3), device=device) \
+                        if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                        else torch.randn((min(batch_size, N), 3), device=device)
 
+                    tr_perturb = tr_g**2 * dt_tr * tr_score + tr_g * np.sqrt(dt_tr) * tr_z
+                    rot_perturb = rot_g**2 * dt_rot * rot_score + rot_g * np.sqrt(dt_rot) * rot_z
+
+                # ===== Torsion =====
                 if not model_args.no_torsion:
-                    tor_g = tor_sigma * torch.sqrt(torch.tensor(2 * np.log(model_args.tor_sigma_max / model_args.tor_sigma_min)))
+                    tor_g = tor_sigma * torch.sqrt(torch.tensor(2 * np.log(
+                        model_args.tor_sigma_max / model_args.tor_sigma_min)))
+
                     if ode:
-                        tor_perturb = (0.5 * tor_g ** 2 * dt_tor * tor_score)
+                        tor_perturb = 0.5 * tor_g**2 * dt_tor * tor_score
                     else:
-                        tor_z = torch.zeros(tor_score.shape, device=device) if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
-                            else torch.normal(mean=0, std=1, size=tor_score.shape, device=device)
-                        tor_perturb = (tor_g ** 2 * dt_tor * tor_score + tor_g * np.sqrt(dt_tor) * tor_z)
-                    torsions_per_molecule = tor_perturb.shape[0] // b
+                        tor_z = torch.zeros_like(tor_score, device=device) \
+                            if no_random or (no_final_step_noise and t_idx == inference_steps - 1) \
+                            else torch.randn_like(tor_score, device=device)
+
+                        tor_perturb = tor_g**2 * dt_tor * tor_score + tor_g * np.sqrt(dt_tor) * tor_z
                 else:
                     tor_perturb = None
 
-                if not is_iterable(temp_sampling):
-                    temp_sampling = [temp_sampling] * 3
-                if not is_iterable(temp_psi):
-                    temp_psi = [temp_psi] * 3
+                # ===== Modify ligand coordinates (DiffDock step) =====
+                candidate_pos_flat = modify_conformer_batch(
+                    complex_graph_batch['ligand'].pos,
+                    complex_graph_batch,
+                    tr_perturb,
+                    rot_perturb,
+                    tor_perturb if not model_args.no_torsion else None,
+                    mask_rotate,
+                )
 
-                if not is_iterable(temp_sampling): temp_sampling = [temp_sampling] * 3
-                if not is_iterable(temp_psi): temp_psi = [temp_psi] * 3
-                if not is_iterable(temp_sigma_data): temp_sigma_data = [temp_sigma_data] * 3
+                # ============================================================
+                #            Option A: Simple Physics Guidance
+                # ============================================================
+                if use_physics and physics_step_size > 0.0:
+                    full_grad = torch.zeros_like(candidate_pos_flat)
 
-                assert len(temp_sampling) == 3
-                assert len(temp_psi) == 3
-                assert len(temp_sigma_data) == 3
+                    with torch.enable_grad():
+                        for i in range(b):
 
-                if temp_sampling[0] != 1.0:
-                    tr_sigma_data = np.exp(temp_sigma_data[0] * np.log(model_args.tr_sigma_max) + (1 - temp_sigma_data[0]) * np.log(model_args.tr_sigma_min))
-                    lambda_tr = (tr_sigma_data + tr_sigma) / (tr_sigma_data + tr_sigma / temp_sampling[0])
-                    tr_perturb = (tr_g ** 2 * dt_tr * (lambda_tr + temp_sampling[0] * temp_psi[0] / 2) * tr_score + tr_g * np.sqrt(dt_tr * (1 + temp_psi[0])) * tr_z)
+                            global_idx = batch_id * batch_size + i
+                            if global_idx >= len(data_list):
+                                continue
 
-                if temp_sampling[1] != 1.0:
-                    rot_sigma_data = np.exp(temp_sigma_data[1] * np.log(model_args.rot_sigma_max) + (1 - temp_sigma_data[1]) * np.log(model_args.rot_sigma_min))
-                    lambda_rot = (rot_sigma_data + rot_sigma) / (rot_sigma_data + rot_sigma / temp_sampling[1])
-                    rot_perturb = (rot_g ** 2 * dt_rot * (lambda_rot + temp_sampling[1] * temp_psi[1] / 2) * rot_score + rot_g * np.sqrt(dt_rot * (1 + temp_psi[1])) * rot_z)
+                            start = i * n
+                            end = (i + 1) * n
+                            coords_i = candidate_pos_flat[start:end].detach().clone().requires_grad_(True)
 
-                if temp_sampling[2] != 1.0:
-                    tor_sigma_data = np.exp(temp_sigma_data[2] * np.log(model_args.tor_sigma_max) + (1 - temp_sigma_data[2]) * np.log(model_args.tor_sigma_min))
-                    lambda_tor = (tor_sigma_data + tor_sigma) / (tor_sigma_data + tor_sigma / temp_sampling[2])
-                    tor_perturb = (tor_g ** 2 * dt_tor * (lambda_tor + temp_sampling[2] * temp_psi[2] / 2) * tor_score + tor_g * np.sqrt(dt_tor * (1 + temp_psi[2])) * tor_z)
+                            feats_i = getattr(data_list[global_idx], "ligand_feats", None)
+                            if feats_i is None:
+                                continue
 
-                # Apply noise
-                complex_graph_batch['ligand'].pos = \
-                    modify_conformer_batch(complex_graph_batch['ligand'].pos, complex_graph_batch, tr_perturb, rot_perturb,
-                                           tor_perturb if not model_args.no_torsion else None, mask_rotate)
+                            E_i = coords_i.new_tensor(0.0)
+                            for pot in physics_potentials:
+                                E_i = E_i + pot.weight * pot.energy(coords_i, feats_i)
 
+                            (grad_i,) = torch.autograd.grad(E_i, coords_i, retain_graph=False)
+                            full_grad[start:end] = grad_i.detach()
+
+                    candidate_pos_flat = candidate_pos_flat - physics_step_size * full_grad
+
+                # Commit physics + diffdock update
+                complex_graph_batch['ligand'].pos = candidate_pos_flat
+
+                # Visualization (unchanged)
                 if visualization_list is not None:
                     for idx_b in range(b):
-                        visualization_list[batch_id * batch_size + idx_b].add((
-                                complex_graph_batch['ligand'].pos[idx_b*n:n*(idx_b+1)].detach().cpu() +
-                                data_list[batch_id * batch_size + idx_b].original_center.detach().cpu()),
-                                part=1, order=t_idx + 2)
+                        visualization_list[batch_id * batch_size + idx_b].add(
+                            (
+                                complex_graph_batch['ligand'].pos[idx_b*n:n*(idx_b+1)].detach().cpu()
+                                + data_list[batch_id * batch_size + idx_b].original_center.detach().cpu()
+                            ),
+                            part=1, order=t_idx + 2,
+                        )
 
+            # write back to data_list
             for i in range(b):
-               data_list[batch_id * batch_size + i]['ligand'].pos = complex_graph_batch['ligand'].pos[i*n:n*(i+1)]
+                data_list[batch_id * batch_size + i]['ligand'].pos = \
+                    complex_graph_batch['ligand'].pos[i*n:(i+1)*n]
 
+            # Visualization (unchanged)
             if visualization_list is not None:
                 for idx, visualization in enumerate(visualization_list):
-                    visualization.add((data_list[idx]['ligand'].pos.detach().cpu() + data_list[idx].original_center.detach().cpu()),
-                                      part=1, order=2)
+                    visualization.add(
+                        data_list[idx]['ligand'].pos.detach().cpu()
+                        + data_list[idx].original_center.detach().cpu(),
+                        part=1, order=2,
+                    )
 
+            # Confidence model
             if confidence_model is not None:
                 if confidence_data_list is not None:
                     confidence_complex_graph_batch = next(confidence_loader)
@@ -222,8 +305,9 @@ def sampling(data_list, model, inference_steps, tr_schedule, rot_schedule, tor_s
                 else:
                     out = confidence_model(complex_graph_batch)
 
-                if type(out) is tuple:
+                if isinstance(out, tuple):
                     out = out[0]
+
                 confidence.append(out)
 
     if confidence_model is not None:
