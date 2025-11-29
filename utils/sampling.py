@@ -239,7 +239,7 @@ def sampling(
                 )
 
                 # ============================================================
-                #            Option A: Simple Physics Guidance
+                #             Simple Physics Guidance
                 # ============================================================
                 apply_physics = (
                     use_physics
@@ -317,7 +317,7 @@ def sampling(
                 # Commit physics + diffdock update
                 complex_graph_batch['ligand'].pos = candidate_pos_flat
 
-                # Visualization (unchanged)
+                # Visualization
                 if visualization_list is not None:
                     for idx_b in range(b):
                         visualization_list[batch_id * batch_size + idx_b].add(

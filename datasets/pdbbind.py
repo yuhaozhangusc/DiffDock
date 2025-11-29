@@ -116,7 +116,7 @@ class NoiseTransform(BaseTransform):
 
 
 # ======================================================================
-# Physics-guidance ligand features (Option A for DiffDock + Boltz-style potentials)
+# Physics-guidance ligand features
 # ======================================================================
 
 periodic_table = GetPeriodicTable()
@@ -444,7 +444,6 @@ class PDBBind(Dataset):
             return [], []
 
         try:
-            # Read ligand molecule from disk (standard PDBBind path)
             lig = read_mol(self.pdbbind_dir, name, suffix=self.ligand_file, remove_hs=False)
 
             if self.max_lig_size != None and lig.GetNumHeavyAtoms() > self.max_lig_size:
@@ -458,7 +457,7 @@ class PDBBind(Dataset):
             get_lig_graph_with_matching(lig, complex_graph, self.popsize, self.maxiter, self.matching, self.keep_original,
                                         self.num_conformers, remove_hs=self.remove_hs, tries=self.matching_tries)
 
-            # === Attach ligand physics features for Boltz-style potentials (Option A) ===
+            # === Attach ligand physics features for Boltz-style potentials ===
             attach_ligand_physics_features(complex_graph, lig)
 
             # Build receptor graph

@@ -188,7 +188,7 @@ class AnglePotential(Potential):
 
 def build_default_potentials() -> List[Potential]:
     """
-    Factory for Option A: simple ligand geometry + clash control.
+    Factory for simple ligand geometry + clash control.
 
     You can tune the weights here to control the strength of each term.
     """

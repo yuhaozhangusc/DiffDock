@@ -175,6 +175,7 @@ def main(args):
             confidence_args = Namespace(**yaml.full_load(f))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Update to cpu
     device = torch.device('cpu')
     logger.info(f"DiffDock will run on {device}")
 
